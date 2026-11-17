@@ -59,6 +59,9 @@ from OpenSSL.crypto import (
     PKey,
     X509Name,
     X509Store,
+    X509StoreContext,
+    X509StoreContextError,
+    X509StorePurpose,
     dump_certificate,
     dump_privatekey,
     get_elliptic_curves,
@@ -4704,6 +4707,273 @@ class TestMemoryBIO:
             return [cadesc, sedesc]
 
         self._check_client_ca_list(set_replaces_add_ca)
+
+
+class TestCertStorePurpose:
+    """
+    Tests that a purpose set on a `Context`'s certificate store is applied to
+    certificate verification during the TLS handshake.
+    """
+
+    root_cert = load_certificate(FILETYPE_PEM, root_cert_pem)
+    server_cert = load_certificate(FILETYPE_PEM, server_cert_pem)
+    server_key = load_privatekey(FILETYPE_PEM, server_key_pem)
+    client_cert = load_certificate(FILETYPE_PEM, client_cert_pem)
+    client_key = load_privatekey(FILETYPE_PEM, client_key_pem)
+
+    def _server_context(
+        self, purpose: int | None, seen: list[tuple[int, int, int]]
+    ) -> Context:
+        """
+        Create a server `Context` that requires and verifies a client
+        certificate, with *purpose* configured on its certificate store.
+        """
+
+        def verify_cb(
+            conn: Connection,
+            cert: X509,
+            errnum: int,
+            depth: int,
+            ok: int,
+        ) -> bool:
+            seen.append((errnum, depth, ok))
+            return bool(ok)
+
+        ctx = Context(SSLv23_METHOD)
+        ctx.set_options(OP_NO_SSLv2 | OP_NO_SSLv3 | OP_SINGLE_DH_USE)
+        ctx.set_verify(
+            VERIFY_PEER | VERIFY_FAIL_IF_NO_PEER_CERT | VERIFY_CLIENT_ONCE,
+            verify_cb,
+        )
+        store = ctx.get_cert_store()
+        assert store is not None
+        store.add_cert(self.root_cert)
+        if purpose is not None:
+            store.set_purpose(purpose)
+        ctx.use_privatekey(self.server_key)
+        ctx.use_certificate(self.server_cert)
+        return ctx
+
+    def _handshake(
+        self,
+        cert: X509,
+        key: PKey,
+        purpose: int | None,
+    ) -> tuple[list[tuple[int, int, int]], Connection, Connection]:
+        """
+        Run an in-memory handshake in which the client presents *cert*, against
+        a server whose store has *purpose*.  Return the error numbers the
+        server's verify callback observed and both connections.
+        """
+        seen: list[tuple[int, int, int]] = []
+        server_conn = Connection(self._server_context(purpose, seen), None)
+        server_conn.set_accept_state()
+
+        client_ctx = Context(SSLv23_METHOD)
+        client_ctx.set_options(OP_NO_SSLv2 | OP_NO_SSLv3 | OP_SINGLE_DH_USE)
+        client_ctx.set_verify(VERIFY_PEER, verify_cb)
+        client_store = client_ctx.get_cert_store()
+        assert client_store is not None
+        client_store.add_cert(self.root_cert)
+        client_ctx.use_certificate(cert)
+        client_ctx.use_privatekey(key)
+        client_conn = Connection(client_ctx, None)
+        client_conn.set_connect_state()
+
+        interact_in_memory(client_conn, server_conn)
+        return seen, client_conn, server_conn
+
+    def test_client_purpose_accepts_client_cert(self) -> None:
+        """
+        A server store set to `X509StorePurpose.SSL_CLIENT` accepts a
+        *clientAuth* certificate presented by the client.
+        """
+        seen, _, server_conn = self._handshake(
+            self.client_cert, self.client_key, X509StorePurpose.SSL_CLIENT
+        )
+        assert seen == [(0, 1, 1), (0, 0, 1)]
+        assert _lib.SSL_get_verify_result(server_conn._ssl) == 0
+
+    def test_client_purpose_rejects_server_cert(self) -> None:
+        """
+        A server store set to `X509StorePurpose.SSL_CLIENT` rejects a
+        *serverAuth* certificate presented by the client.  The handshake fails
+        and the mismatch is visible as error code 26, both in the verify
+        callback and in the connection's verify result.
+        """
+        seen: list[tuple[int, int, int]] = []
+        server_conn = Connection(
+            self._server_context(X509StorePurpose.SSL_CLIENT, seen), None
+        )
+        server_conn.set_accept_state()
+
+        client_ctx = Context(SSLv23_METHOD)
+        client_ctx.set_verify(VERIFY_PEER, verify_cb)
+        client_store = client_ctx.get_cert_store()
+        assert client_store is not None
+        client_store.add_cert(self.root_cert)
+        client_ctx.use_certificate(self.server_cert)
+        client_ctx.use_privatekey(self.server_key)
+        client_conn = Connection(client_ctx, None)
+        client_conn.set_connect_state()
+
+        with pytest.raises(Error, match="certificate verify failed"):
+            interact_in_memory(client_conn, server_conn)
+
+        assert seen == [(26, 0, 0)]
+        assert _lib.SSL_get_verify_result(server_conn._ssl) == 26
+
+    def test_server_purpose_accepts_server_cert(self) -> None:
+        """
+        A server store set to `X509StorePurpose.SSL_SERVER` accepts a
+        *serverAuth* certificate presented by the client.
+        """
+        seen, _, server_conn = self._handshake(
+            self.server_cert, self.server_key, X509StorePurpose.SSL_SERVER
+        )
+        assert seen == [(0, 1, 1), (0, 0, 1)]
+        assert _lib.SSL_get_verify_result(server_conn._ssl) == 0
+
+    def test_server_purpose_rejects_client_cert(self) -> None:
+        """
+        A server store set to `X509StorePurpose.SSL_SERVER` rejects a
+        *clientAuth* certificate presented by the client with error code 26.
+        """
+        with pytest.raises(Error, match="certificate verify failed"):
+            self._handshake(
+                self.client_cert,
+                self.client_key,
+                X509StorePurpose.SSL_SERVER,
+            )
+
+    @pytest.mark.parametrize(
+        "purpose, use_server_cert, accepted",
+        [
+            (None, True, False),
+            (None, False, True),
+            (X509StorePurpose.NONE, True, False),
+            (X509StorePurpose.NONE, False, True),
+            (X509StorePurpose.SSL_CLIENT, True, False),
+            (X509StorePurpose.SSL_CLIENT, False, True),
+            (X509StorePurpose.SSL_SERVER, True, True),
+            (X509StorePurpose.SSL_SERVER, False, False),
+            (X509StorePurpose.ANY, True, True),
+            (X509StorePurpose.ANY, False, True),
+        ],
+    )
+    def test_purpose_matrix(
+        self, purpose: int | None, use_server_cert: bool, accepted: bool
+    ) -> None:
+        """
+        The purpose configured on the server's store decides, during the
+        handshake, which certificate purpose the client may present.
+
+        The five states are: unset, the explicit ``NONE`` purpose,
+        ``SSL_CLIENT``, ``SSL_SERVER`` and ``ANY``.  With no purpose set --
+        including the explicit ``NONE`` -- OpenSSL derives ``SSL_CLIENT`` from
+        the server's role, so the *serverAuth* certificate is rejected and the
+        *clientAuth* one accepted, exactly like an explicit ``SSL_CLIENT``.
+        ``SSL_SERVER`` inverts that, and ``ANY`` lifts the restriction and
+        accepts both.  Every rejection uses error code 26.
+        """
+        if use_server_cert:
+            cert, key = self.server_cert, self.server_key
+        else:
+            cert, key = self.client_cert, self.client_key
+
+        if accepted:
+            seen, _, _ = self._handshake(cert, key, purpose)
+            assert seen == [(0, 1, 1), (0, 0, 1)]
+        else:
+            with pytest.raises(Error, match="certificate verify failed"):
+                self._handshake(cert, key, purpose)
+
+    def test_handshake_rejects_what_precheck_used_to_accept(self) -> None:
+        """
+        The handshake accepts a *clientAuth* certificate in the client role
+        but rejects a *serverAuth* one with error code 26, even with no
+        purpose configured -- while `X509StoreContext` alone accepts both.
+
+        This is the disagreement the purpose API exists to close: precheck
+        can now be configured to reach the same verdict as the handshake.
+        """
+        seen: list[tuple[int, int, int]] = []
+        server_conn = Connection(
+            self._server_context(X509StorePurpose.SSL_CLIENT, seen), None
+        )
+        server_conn.set_accept_state()
+
+        client_ctx = Context(SSLv23_METHOD)
+        client_ctx.set_verify(VERIFY_PEER, verify_cb)
+        client_store = client_ctx.get_cert_store()
+        assert client_store is not None
+        client_store.add_cert(self.root_cert)
+        client_ctx.use_certificate(self.server_cert)
+        client_ctx.use_privatekey(self.server_key)
+        client_conn = Connection(client_ctx, None)
+        client_conn.set_connect_state()
+
+        with pytest.raises(Error, match="certificate verify failed"):
+            interact_in_memory(client_conn, server_conn)
+        assert seen == [(26, 0, 0)]
+
+        # The same store, used for precheck, reaches the same verdict.
+        store = X509Store()
+        store.add_cert(self.root_cert)
+        store.set_purpose(X509StorePurpose.SSL_CLIENT)
+        store_ctx = X509StoreContext(store, self.server_cert)
+        with pytest.raises(X509StoreContextError) as exc:
+            store_ctx.verify_certificate()
+        assert exc.value.errors[0] == 26
+
+    def test_purpose_applies_to_handshakes_after_it_is_set(self) -> None:
+        """
+        A purpose configured on the store is enforced by handshakes performed
+        afterwards, even when the `Connection` object was created before the
+        purpose was set: only peers verified earlier escape the restriction.
+        """
+        seen: list[tuple[int, int, int]] = []
+        server_ctx = self._server_context(None, seen)
+        store = server_ctx.get_cert_store()
+        assert store is not None
+        store.set_purpose(X509StorePurpose.SSL_CLIENT)
+
+        client_ctx = Context(SSLv23_METHOD)
+        client_ctx.set_verify(VERIFY_PEER, verify_cb)
+        client_store = client_ctx.get_cert_store()
+        assert client_store is not None
+        client_store.add_cert(self.root_cert)
+        client_ctx.use_certificate(self.server_cert)
+        client_ctx.use_privatekey(self.server_key)
+        client_conn = Connection(client_ctx, None)
+        client_conn.set_connect_state()
+
+        server_conn = Connection(server_ctx, None)
+        server_conn.set_accept_state()
+        with pytest.raises(Error, match="certificate verify failed"):
+            interact_in_memory(client_conn, server_conn)
+
+        assert seen == [(26, 0, 0)]
+        assert _lib.SSL_get_verify_result(server_conn._ssl) == 26
+
+    def test_store_from_get_cert_store_keeps_purpose(self) -> None:
+        """
+        The store returned by `Context.get_cert_store` is a view onto the
+        context's own store, so configuring a purpose through one view is
+        visible through the next.
+        """
+        ctx = Context(SSLv23_METHOD)
+        store = ctx.get_cert_store()
+        assert store is not None
+        store.add_cert(self.root_cert)
+        store.set_purpose(X509StorePurpose.SSL_CLIENT)
+
+        again = ctx.get_cert_store()
+        assert again is not None
+        store_ctx = X509StoreContext(again, self.server_cert)
+        with pytest.raises(X509StoreContextError) as exc:
+            store_ctx.verify_certificate()
+        assert exc.value.errors[0] == 26
 
 
 class TestInfoConstants:

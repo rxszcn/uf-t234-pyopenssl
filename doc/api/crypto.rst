@@ -118,6 +118,24 @@ X509StoreFlags constants
     .. data:: CHECK_SS_SIGNATURE
     .. data:: PARTIAL_CHAIN
 
+.. _openssl-x509storepurpose:
+
+X509StorePurpose constants
+--------------------------
+
+.. autoclass:: X509StorePurpose
+
+    .. data:: NONE
+    .. data:: SSL_CLIENT
+    .. data:: SSL_SERVER
+    .. data:: NS_SSL_SERVER
+    .. data:: SMIME_SIGN
+    .. data:: SMIME_ENCRYPT
+    .. data:: CRL_SIGN
+    .. data:: ANY
+    .. data:: OCSP_HELPER
+    .. data:: TIMESTAMP_SIGN
+
 .. _openssl-x509storeflags:
 
 PKey objects

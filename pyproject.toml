@@ -40,6 +40,9 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 addopts = "-r s --strict-markers"
 testpaths = ["tests"]
+# Test the sources in this tree even if a different revision of the package
+# happens to be installed (or an editable install points elsewhere).
+pythonpath = ["src"]
 
 [tool.ruff]
 lint.select = ['E', 'F', 'I', 'W', 'UP', 'RUF']

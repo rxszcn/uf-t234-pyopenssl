@@ -21,6 +21,13 @@ Deprecations:
 Changes:
 ^^^^^^^^
 
+- Added ``OpenSSL.crypto.X509Store.set_purpose()`` and the ``OpenSSL.crypto.X509StorePurpose``
+  constants, so a certificate's intended purpose can be enforced before it is used.
+  A store configured with ``X509StorePurpose.SSL_CLIENT`` rejects a certificate issued for
+  server use with ``X509_V_ERR_INVALID_PURPOSE`` (error code 26), matching the verdict a TLS
+  handshake reaches. Because ``OpenSSL.SSL.Context.get_cert_store()`` returns the context's
+  own store, the same setting also applies to certificate verification during a handshake.
+  Unknown purpose values raise ``ValueError`` instead of being silently ignored by OpenSSL.
 - Fixed a race in which an exception raised by a verify, ALPN selection, OCSP, or DTLS cookie callback for one ``Connection`` could be raised on an unrelated ``Connection`` created from the same ``Context`` and used concurrently from another thread. Exceptions from these callbacks are now tracked per ``Connection``. Discovered and reported by SecDim Security Research.
 - Fixed exceptions raised by a verify callback registered with ``Connection.set_verify`` being swallowed instead of being propagated to the caller.
 

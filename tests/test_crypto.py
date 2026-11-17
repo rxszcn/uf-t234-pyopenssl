@@ -24,6 +24,7 @@ from cryptography.hazmat.primitives.asymmetric import (
     ed25519,
     rsa,
 )
+from cryptography.x509.oid import ExtendedKeyUsageOID
 
 from OpenSSL._util import ffi as _ffi
 from OpenSSL._util import lib as _lib
@@ -41,6 +42,7 @@ from OpenSSL.crypto import (
     X509StoreContext,
     X509StoreContextError,
     X509StoreFlags,
+    X509StorePurpose,
     _EllipticCurve,
     _Key,
     _PrivateKey,
@@ -2013,6 +2015,282 @@ class TestX509Store:
         store = X509Store()
         with pytest.raises(Error):
             store.load_locations(cafile=str(invalid_ca_file))
+
+    def test_purpose_constants(self) -> None:
+        """
+        `X509StorePurpose` exposes the OpenSSL purpose identifiers as integers.
+        """
+        assert X509StorePurpose.NONE == 0
+        assert X509StorePurpose.SSL_CLIENT == 1
+        assert X509StorePurpose.SSL_SERVER == 2
+        for const in [
+            X509StorePurpose.NS_SSL_SERVER,
+            X509StorePurpose.SMIME_SIGN,
+            X509StorePurpose.SMIME_ENCRYPT,
+            X509StorePurpose.CRL_SIGN,
+            X509StorePurpose.ANY,
+            X509StorePurpose.OCSP_HELPER,
+            X509StorePurpose.TIMESTAMP_SIGN,
+        ]:
+            assert isinstance(const, int)
+            assert const > 0
+
+    @pytest.mark.parametrize("purpose", [None, "1", 1.0, object(), b"1"])
+    def test_set_purpose_wrong_args(self, purpose: object) -> None:
+        """
+        `X509Store.set_purpose` raises `TypeError` if passed a non-integer.
+        """
+        store = X509Store()
+        with pytest.raises(TypeError):
+            store.set_purpose(purpose)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("purpose", [-1, 10, 11, 99, 2**31 - 1])
+    def test_set_purpose_unknown_value(self, purpose: int) -> None:
+        """
+        `X509Store.set_purpose` raises `ValueError` for values that are not
+        one of the `X509StorePurpose` constants.
+
+        Rejecting them up front is deliberate: OpenSSL silently ignores an
+        unknown purpose (it only pushes an error onto its error queue), so the
+        store would otherwise keep verifying with the previous purpose and the
+        caller would never learn that the restriction was not applied.
+        """
+        store = X509Store()
+        with pytest.raises(ValueError):
+            store.set_purpose(purpose)
+
+    def test_set_purpose_unknown_value_keeps_previous_purpose(self) -> None:
+        """
+        A `ValueError` from `X509Store.set_purpose` leaves the store's
+        previously configured purpose in effect.
+        """
+        store = X509Store()
+        store.add_cert(load_certificate(FILETYPE_PEM, root_cert_pem))
+        store.set_purpose(X509StorePurpose.SSL_CLIENT)
+
+        with pytest.raises(ValueError):
+            store.set_purpose(99)
+
+        store_ctx = X509StoreContext(
+            store, load_certificate(FILETYPE_PEM, server_cert_pem)
+        )
+        with pytest.raises(X509StoreContextError) as exc:
+            store_ctx.verify_certificate()
+        assert exc.value.errors[0] == 26
+
+    @pytest.mark.parametrize(
+        "purpose, cert_pem",
+        [
+            (None, server_cert_pem),
+            (None, client_cert_pem),
+            (X509StorePurpose.NONE, server_cert_pem),
+            (X509StorePurpose.NONE, client_cert_pem),
+            (X509StorePurpose.SSL_CLIENT, server_cert_pem),
+            (X509StorePurpose.SSL_CLIENT, client_cert_pem),
+            (X509StorePurpose.SSL_SERVER, server_cert_pem),
+            (X509StorePurpose.SSL_SERVER, client_cert_pem),
+            (X509StorePurpose.ANY, server_cert_pem),
+            (X509StorePurpose.ANY, client_cert_pem),
+        ],
+    )
+    def test_purpose_matrix(
+        self, purpose: int | None, cert_pem: bytes
+    ) -> None:
+        """
+        The purpose of the store decides which end-entity certificate verifies.
+
+        The five states are: no purpose configured, the explicit ``NONE``
+        purpose, ``SSL_CLIENT``, ``SSL_SERVER`` and ``ANY``.  A *serverAuth*
+        certificate is rejected with error code 26 unless the store is in the
+        "no restriction" states (unset, ``NONE``, ``ANY``) or in
+        ``SSL_SERVER``; a *clientAuth* certificate is rejected with the same
+        code unless the store is in one of those states or in ``SSL_CLIENT``.
+        """
+        store = X509Store()
+        store.add_cert(load_certificate(FILETYPE_PEM, root_cert_pem))
+        if purpose is not None:
+            store.set_purpose(purpose)
+
+        store_ctx = X509StoreContext(
+            store, load_certificate(FILETYPE_PEM, cert_pem)
+        )
+        rejects_server = purpose == X509StorePurpose.SSL_CLIENT
+        rejects_client = purpose == X509StorePurpose.SSL_SERVER
+        is_server_cert = cert_pem == server_cert_pem
+        should_reject = rejects_server if is_server_cert else rejects_client
+
+        if should_reject:
+            with pytest.raises(X509StoreContextError) as exc:
+                store_ctx.verify_certificate()
+            assert exc.value.errors[0] == 26
+            assert str(exc.value) == "unsuitable certificate purpose"
+        else:
+            assert store_ctx.verify_certificate() is None  # type: ignore[func-returns-value]
+
+    def test_set_purpose_none_clears_previous_purpose(self) -> None:
+        """
+        Setting `X509StorePurpose.NONE` removes a previously set purpose, so
+        certificates of any purpose verify again.
+        """
+        store = X509Store()
+        store.add_cert(load_certificate(FILETYPE_PEM, root_cert_pem))
+        store.set_purpose(X509StorePurpose.SSL_CLIENT)
+        store.set_purpose(X509StorePurpose.NONE)
+
+        store_ctx = X509StoreContext(
+            store, load_certificate(FILETYPE_PEM, server_cert_pem)
+        )
+        assert store_ctx.verify_certificate() is None  # type: ignore[func-returns-value]
+
+    def test_set_purpose_last_call_wins(self) -> None:
+        """
+        Calling `X509Store.set_purpose` again replaces the previous purpose.
+        """
+        store = X509Store()
+        store.add_cert(load_certificate(FILETYPE_PEM, root_cert_pem))
+        store.set_purpose(X509StorePurpose.SSL_CLIENT)
+        store.set_purpose(X509StorePurpose.SSL_SERVER)
+
+        store_ctx = X509StoreContext(
+            store, load_certificate(FILETYPE_PEM, client_cert_pem)
+        )
+        with pytest.raises(X509StoreContextError) as exc:
+            store_ctx.verify_certificate()
+        assert exc.value.errors[0] == 26
+
+    def test_set_purpose_reports_offending_certificate(self) -> None:
+        """
+        A purpose mismatch is attributed to the end-entity certificate.
+        """
+        store = X509Store()
+        store.add_cert(load_certificate(FILETYPE_PEM, root_cert_pem))
+        store.set_purpose(X509StorePurpose.SSL_CLIENT)
+
+        cert = load_certificate(FILETYPE_PEM, server_cert_pem)
+        store_ctx = X509StoreContext(store, cert)
+        with pytest.raises(X509StoreContextError) as exc:
+            store_ctx.verify_certificate()
+        assert exc.value.certificate.get_subject().CN == "lovely server"
+        assert exc.value.errors[1] == 0
+
+    def test_purpose_ignores_certificates_without_eku(self) -> None:
+        """
+        A certificate that carries no extended key usage extension satisfies
+        any purpose, so the purpose setting leaves its verification unchanged.
+
+        This keeps the purpose check from breaking chains built from CAs that
+        predate extended key usage.
+        """
+        store = X509Store()
+        store.add_cert(load_certificate(FILETYPE_PEM, root_cert_pem))
+        store.add_cert(load_certificate(FILETYPE_PEM, intermediate_cert_pem))
+
+        for purpose in (
+            X509StorePurpose.SSL_CLIENT,
+            X509StorePurpose.SSL_SERVER,
+            X509StorePurpose.NS_SSL_SERVER,
+            X509StorePurpose.SMIME_SIGN,
+            X509StorePurpose.SMIME_ENCRYPT,
+        ):
+            store.set_purpose(purpose)
+            store_ctx = X509StoreContext(
+                store,
+                load_certificate(FILETYPE_PEM, intermediate_server_cert_pem),
+            )
+            assert store_ctx.verify_certificate() is None  # type: ignore[func-returns-value]
+
+    def test_purpose_is_checked_on_ca_certificates(self) -> None:
+        """
+        The extended key usage of CA certificates in the chain is checked too.
+
+        A purpose that the issuing CA's own extended key usage does not allow
+        fails with error code 26 attributed to the CA (depth 1), even though
+        the end-entity certificate would have been acceptable.
+        """
+        now = datetime.now(timezone.utc)
+        ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        ca_name = x509.Name(
+            [x509.NameAttribute(x509.NameOID.COMMON_NAME, "Purpose CA")]
+        )
+        ca = (
+            x509.CertificateBuilder()
+            .subject_name(ca_name)
+            .issuer_name(ca_name)
+            .public_key(ca_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(days=1))
+            .not_valid_after(now + timedelta(days=30))
+            .add_extension(
+                x509.BasicConstraints(ca=True, path_length=None),
+                critical=True,
+            )
+            .add_extension(
+                x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]),
+                critical=False,
+            )
+            .sign(ca_key, hashes.SHA256())
+        )
+        leaf = (
+            x509.CertificateBuilder()
+            .subject_name(
+                x509.Name(
+                    [x509.NameAttribute(x509.NameOID.COMMON_NAME, "leaf")]
+                )
+            )
+            .issuer_name(ca_name)
+            .public_key(ca_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(days=1))
+            .not_valid_after(now + timedelta(days=30))
+            .add_extension(
+                x509.BasicConstraints(ca=False, path_length=None),
+                critical=True,
+            )
+            .add_extension(
+                x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH]),
+                critical=False,
+            )
+            .sign(ca_key, hashes.SHA256())
+        )
+
+        store = X509Store()
+        store.add_cert(
+            load_certificate(
+                FILETYPE_PEM, ca.public_bytes(serialization.Encoding.PEM)
+            )
+        )
+        store.set_purpose(X509StorePurpose.SSL_CLIENT)
+        store_ctx = X509StoreContext(
+            store,
+            load_certificate(
+                FILETYPE_PEM, leaf.public_bytes(serialization.Encoding.PEM)
+            ),
+        )
+        with pytest.raises(X509StoreContextError) as exc:
+            store_ctx.verify_certificate()
+        assert exc.value.errors[0] == 26
+        assert exc.value.errors[1] == 1
+        assert (
+            exc.value.certificate.to_cryptography().subject.rfc4514_string()
+            == "CN=Purpose CA"
+        )
+
+    def test_purpose_does_not_leak_to_other_stores(self) -> None:
+        """
+        Setting a purpose on one store does not affect an unrelated store.
+        """
+        restricted = X509Store()
+        restricted.add_cert(load_certificate(FILETYPE_PEM, root_cert_pem))
+        restricted.set_purpose(X509StorePurpose.SSL_CLIENT)
+
+        unrestricted = X509Store()
+        unrestricted.add_cert(load_certificate(FILETYPE_PEM, root_cert_pem))
+
+        cert = load_certificate(FILETYPE_PEM, server_cert_pem)
+        with pytest.raises(X509StoreContextError):
+            X509StoreContext(restricted, cert).verify_certificate()
+        # Verification must succeed, i.e. not raise.
+        X509StoreContext(unrestricted, cert).verify_certificate()
 
 
 def _runopenssl(pem: bytes, *args: bytes) -> bytes:

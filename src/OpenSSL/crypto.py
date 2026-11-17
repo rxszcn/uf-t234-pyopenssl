@@ -62,6 +62,7 @@ __all__ = [
     "X509StoreContext",
     "X509StoreContextError",
     "X509StoreFlags",
+    "X509StorePurpose",
     "dump_certificate",
     "dump_privatekey",
     "dump_publickey",
@@ -1290,6 +1291,50 @@ class X509StoreFlags:
     PARTIAL_CHAIN: int = _lib.X509_V_FLAG_PARTIAL_CHAIN
 
 
+class X509StorePurpose:
+    """
+    Certificate purposes for X509 verification, used to change the behavior of
+    :class:`X509Store`.
+
+    A purpose restricts which extended key usage a certificate may carry.  For
+    example, a store whose purpose is :py:data:`SSL_CLIENT` accepts a
+    certificate with the *clientAuth* extended key usage and rejects one
+    limited to *serverAuth* with ``X509_V_ERR_INVALID_PURPOSE`` (error code
+    26).
+
+    The check is applied to every certificate of the chain that carries an
+    extended key usage extension, including CA certificates; a certificate
+    without that extension states no restriction and is left to the other
+    checks.  This mirrors OpenSSL's own ``check_purpose`` logic.
+
+    .. versionadded:: 26.4.1
+    """
+
+    NONE: int = 0
+    """
+    No purpose set: the extended key usage is not checked.  This is the
+    default, and the value to pass to :meth:`X509Store.set_purpose` to clear a
+    previously configured purpose.
+    """
+
+    SSL_CLIENT: int = _lib.X509_PURPOSE_SSL_CLIENT
+    SSL_SERVER: int = _lib.X509_PURPOSE_SSL_SERVER
+    NS_SSL_SERVER: int = _lib.X509_PURPOSE_NS_SSL_SERVER
+    SMIME_SIGN: int = _lib.X509_PURPOSE_SMIME_SIGN
+    SMIME_ENCRYPT: int = _lib.X509_PURPOSE_SMIME_ENCRYPT
+    CRL_SIGN: int = _lib.X509_PURPOSE_CRL_SIGN
+    ANY: int = _lib.X509_PURPOSE_ANY
+    OCSP_HELPER: int = _lib.X509_PURPOSE_OCSP_HELPER
+    TIMESTAMP_SIGN: int = _lib.X509_PURPOSE_TIMESTAMP_SIGN
+
+
+_STORE_PURPOSES = frozenset(
+    value
+    for name, value in vars(X509StorePurpose).items()
+    if not name.startswith("_")
+)
+
+
 class X509Store:
     """
     An X.509 store.
@@ -1383,6 +1428,53 @@ class X509Store:
         :return: ``None`` if the verification flags were successfully set.
         """
         _openssl_assert(_lib.X509_STORE_set_flags(self._store, flags) != 0)
+
+    def set_purpose(self, purpose: int) -> None:
+        """
+        Restrict the certificates this store accepts to a particular purpose.
+
+        The purpose is enforced for every chain verified with this store.
+        A certificate that does not carry a suitable extended key usage is
+        rejected with ``X509_V_ERR_INVALID_PURPOSE`` (error code 26), which
+        surfaces from :meth:`X509StoreContext.verify_certificate` as an
+        :class:`X509StoreContextError` whose first entry in ``errors`` is
+        ``26``.
+
+        Only extended key usage is enforced.  A certificate with no extended
+        key usage extension at all satisfies every purpose, so CAs that predate
+        that extension are not affected.
+
+        .. note::
+
+          When used on the store returned by
+          :meth:`OpenSSL.SSL.Context.get_cert_store`, the purpose also governs
+          certificate verification during the TLS handshake.  Set it before the
+          handshake starts: a peer verified against the store keeps the verdict
+          it was given, so changing the purpose afterwards does not
+          retroactively reject an established connection.
+
+        .. versionadded:: 26.4.1
+
+        :param int purpose: The purpose to set on this store.  See
+            :class:`X509StorePurpose` for available constants.  Pass
+            :py:data:`X509StorePurpose.NONE` to clear a previously set purpose.
+        :return: ``None`` if the purpose was successfully set.
+        :raises TypeError: If *purpose* is not an integer.
+        :raises ValueError: If *purpose* is not one of the constants defined on
+            :class:`X509StorePurpose`.  Rejecting unknown values up front keeps
+            the behavior identical across the OpenSSL versions this module can
+            be built against, instead of depending on which purpose identifiers
+            a particular build happens to register.
+        """
+        if not isinstance(purpose, int):
+            raise TypeError("purpose must be an integer")
+        if purpose not in _STORE_PURPOSES:
+            raise ValueError(
+                f"{purpose!r} is not a valid X509StorePurpose; expected one "
+                "of the constants defined on X509StorePurpose"
+            )
+
+        _openssl_assert(_lib.X509_STORE_set_purpose(self._store, purpose) != 0)
 
     def set_time(self, vfy_time: datetime.datetime) -> None:
         """
